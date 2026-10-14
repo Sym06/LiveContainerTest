@@ -1,144 +1,168 @@
-name: Xcode - Build
+# Reproducible experimental LiveContainer + SideStore build, 14 October 2026.
+# Copy to .github/workflows/build-livecontainer-sidestore-80045.yml
+# in a GitHub repository that YOU control. No Apple credentials are needed.
+name: Build LiveContainer + SideStore (2FA fix)
 
-on: 
-  push:
-  pull_request:
+on:
   workflow_dispatch:
-    inputs: 
-      release__nightly:
-        description: Create a nightly release
-        type: boolean
-        required: false
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build-livecontainer-sidestore-80045.yml'
+
+permissions:
+  contents: read
 
 jobs:
   build:
-    name: Build using xcodebuild command
-    runs-on: macos-latest
+    name: Build patched IPA on macOS
+    runs-on: macos-26
+    timeout-minutes: 120
     env:
-      scheme: LiveContainer
-      archive_path: archive
-    outputs:
-      scheme: ${{ steps.scheme.outputs.scheme }}
-      archive_path: ${{ env.archive_path }}
-      artifact: ${{ env.scheme }}.ipa
-      artifact2: ${{ env.scheme }}+SideStore.ipa
+      LIVECONTAINER_COMMIT: 4dbe0f9a626de801184a42c0be8d2cb105058e3d
+      SIDESTORE_COMMIT: 12a496ca1c766a102193634879823d16610bf1cd
+      SIDESIGN_OLD_COMMIT: df2b8e4257454f0c7629276d409d6e9d7953fdf6
+      SIDESIGN_FIXED_COMMIT: 752d1ef602aa792a432ffa1e71646dc1ecf7363c
+
     steps:
-      - uses: maxim-lobanov/setup-xcode@v1
+      - name: Check out the workflow repository
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 26.4 for SideStore
+        uses: maxim-lobanov/setup-xcode@v1.6.0
         with:
-          xcode-version: '26.2'
-      - name: Checkout
-        uses: actions/checkout@v6
+          xcode-version: '26.4'
+
+      - name: Install required tools
+        run: brew install ldid xcbeautify wget
+
+      - name: Check out LiveContainer's SideStore fork
+        uses: actions/checkout@v4
         with:
+          repository: LiveContainer/SideStore
+          ref: 12a496ca1c766a102193634879823d16610bf1cd
+          path: vendor/SideStore
           submodules: recursive
-      - name: Set Scheme
-        id: scheme
+          fetch-depth: 1
+
+      - name: Update the SideSign submodule to the fixed commit
+        shell: bash
         run: |
-          if [ $scheme = default ]
-          then
-            scheme_list=$(xcodebuild -list -json | tr -d "\n")
-            scheme=$(echo $scheme_list | ruby -e "require 'json'; puts JSON.parse(STDIN.gets)['project']['targets'][0]")
-            echo Using default scheme: $scheme
-          else
-            echo Using configured scheme: $scheme
-          fi
-          echo "scheme=$scheme" >> $GITHUB_OUTPUT
-      - name: Set filetype_parameter
-        id: filetype_parameter
+          set -euo pipefail
+          test "$(git -C vendor/SideStore rev-parse HEAD)" = "$SIDESTORE_COMMIT"
+          test "$(git -C vendor/SideStore/Dependencies/SideSign rev-parse HEAD)" = "$SIDESIGN_OLD_COMMIT"
+          git -C vendor/SideStore/Dependencies/SideSign fetch --no-tags --depth=1 origin "$SIDESIGN_FIXED_COMMIT"
+          git -C vendor/SideStore/Dependencies/SideSign checkout --detach "$SIDESIGN_FIXED_COMMIT"
+          test "$(git -C vendor/SideStore/Dependencies/SideSign rev-parse HEAD)" = "$SIDESIGN_FIXED_COMMIT"
+          grep -q 'PushedCodeState' vendor/SideStore/Dependencies/SideSign/Sources/DeveloperPortal/Authentication.swift
+          echo "Verified SideSign: $SIDESIGN_FIXED_COMMIT"
+
+      - name: Preload SwiftPM binary dependencies
+        shell: bash
         run: |
-          filetype_parameter=`ls -A | grep -i \\.xcworkspace\$ && echo workspace || echo project`
-          echo "filetype_parameter=$filetype_parameter" >> $GITHUB_OUTPUT
-      - name: Set file_to_build
-        id: file_to_build
+          set -euo pipefail
+          dir="$HOME/Library/Caches/org.swift.swiftpm/artifacts"
+          mkdir -p "$dir"
+          openssl="$dir/https___github_com_krzyzanowskim_OpenSSL_releases_download_3_6_2000_OpenSSL_xcframework_zip"
+          unicorn="$dir/https___github_com_mahee96_unicorn_releases_download_2_1_4_multiarch_Unicorn_xcframework_zip"
+          test -f "$openssl" || curl -fsSL --retry 3 -o "$openssl" 'https://github.com/krzyzanowskim/OpenSSL/releases/download/3.6.2000/OpenSSL.xcframework.zip'
+          test -f "$unicorn" || curl -fsSL --retry 3 -o "$unicorn" 'https://github.com/mahee96/unicorn/releases/download/2.1.4-multiarch/Unicorn.xcframework.zip'
+
+      - name: Build patched SideStore
+        shell: bash
+        working-directory: vendor/SideStore
         run: |
-          file_to_build=`ls -A | grep -i \\.xcworkspace\$ || ls -A | grep -i \\.xcodeproj\$`
-          file_to_build=`echo $file_to_build | awk '{$1=$1;print}'`
-          echo "file_to_build=$file_to_build" >> $GITHUB_OUTPUT
-      - name: Archive
-        env:
-          scheme: ${{ steps.scheme.outputs.scheme }}
-          filetype_parameter: ${{ steps.filetype_parameter.outputs.filetype_parameter }}
-          file_to_build: ${{ steps.file_to_build.outputs.file_to_build }}
-        run: xcodebuild archive -archivePath "$archive_path" -scheme "$scheme" -"$filetype_parameter" "$file_to_build" -sdk iphoneos -arch arm64 -configuration Release | xcpretty && exit ${PIPESTATUS[0]}
-      - name: Tar Build Artifact
-        run: tar -cvf "$archive_path.xcarchive.tar" "$archive_path.xcarchive"
-      - name: Upload a Build Artifact
+          set -euo pipefail
+          python3 scripts/ci/workflow.py build
+          test -s SideStore.ipa
+          unzip -tq SideStore.ipa >/dev/null
+          unzip -Z1 SideStore.ipa | grep -qx 'Payload/SideStore.app/SideStore'
+          shasum -a 256 SideStore.ipa
+
+      - name: Upload intermediate SideStore
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.archive_path }}.xcarchive.tar
-          path: ${{ env.archive_path }}.xcarchive.tar
-      - name: Create IPA
-        run: |
-          sh .github/build_github.sh
+          name: SideStore-patched-intermediate
+          path: vendor/SideStore/SideStore.ipa
+          if-no-files-found: error
 
-      - name: Upload a Build Artifact
-        uses: actions/upload-artifact@v7
+      - name: Select Xcode 26.2 for LiveContainer
+        uses: maxim-lobanov/setup-xcode@v1.6.0
         with:
-          name: ${{ env.scheme }}.ipa
-          path: ${{ env.scheme }}.ipa
-      
-      - name: Upload LiveContainer+SideStore
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ env.scheme }}+SideStore.ipa
-          path: ${{ env.scheme }}+SideStore.ipa
+          xcode-version: '26.2'
 
-  release__nightly:
-    name: Nightly Release
-    permissions:
-      contents: write
-    if: inputs.release__nightly || github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-    runs-on: ubuntu-latest
-    needs: [build]
-    concurrency:
-      group: release__nightly
-      cancel-in-progress: true
+      - name: Check out LiveContainer
+        uses: actions/checkout@v4
+        with:
+          repository: LiveContainer/LiveContainer
+          ref: 4dbe0f9a626de801184a42c0be8d2cb105058e3d
+          path: vendor/LiveContainer
+          submodules: recursive
+          fetch-depth: 1
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-      - name: Download a Build Artifact
-        uses: actions/download-artifact@v8
-        with:
-          name: ${{ needs.build.outputs.artifact }}
-      - name: Download a Build Artifact2
-        uses: actions/download-artifact@v8
-        with:
-          name: ${{ needs.build.outputs.artifact2 }}
-      - name: Get Commit Info
-        id: commit_info
+      - name: Archive LiveContainer
+        shell: bash
+        working-directory: vendor/LiveContainer
         run: |
-          COMMIT_SHA=$(git rev-parse HEAD)
-          COMMIT_MSG=$(git log -1 --pretty=%s)
-          echo "COMMIT_SHA=$COMMIT_SHA" >> $GITHUB_ENV
-          echo "COMMIT_MSG=$COMMIT_MSG" >> $GITHUB_ENV
-      - name: Update AltStore source
-        id: update_source
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NIGHTLY_LINK: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
-          commit_sha: ${{ env.COMMIT_SHA }}
-          commit_msg: ${{ env.COMMIT_MSG }}
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$LIVECONTAINER_COMMIT"
+          xcodebuild archive -archivePath archive -scheme LiveContainer -project LiveContainer.xcodeproj -sdk iphoneos -arch arm64 -configuration Release 2>&1 | xcbeautify --renderer github-actions
+          test -d archive.xcarchive/Products/Applications/LiveContainer.app
+
+      - name: Package LiveContainer using the just-built SideStore
+        shell: bash
+        working-directory: vendor/LiveContainer
         run: |
-          python .github/update_json.py
-      - name: Nightly Release
-        uses: andelf/nightly-release@5834076edc55cc05975561c9722043f072ac5c26
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with: 
-          body: |
-            **Commit:** [${{ github.sha }}](https://github.com/${{ github.repository }}/commit/${{ github.sha }})
-            **Message:** ${{ github.event.head_commit.message }}
-            
-            This is a nightly release [created automatically with GitHub Actions workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}).
-          files: |
-            ${{ needs.build.outputs.artifact }}
-            ${{ needs.build.outputs.artifact2 }}
-            .github/apps_nightly.json
-      - name: Update apps.json in Release 1.0
-        uses: softprops/action-gh-release@v3
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('.github/build_github.sh')
+          script = path.read_text()
+          original = 'wget https://github.com/LiveContainer/SideStore/releases/download/nightly/SideStore.ipa'
+          replacement = 'cp "$GITHUB_WORKSPACE/vendor/SideStore/SideStore.ipa" SideStore.ipa'
+          if script.count(original) != 1:
+              raise SystemExit('Unexpected upstream build script: refusing to apply unverified replacement')
+          path.write_text(script.replace(original, replacement))
+          PY
+          scheme=LiveContainer archive_path=archive sh .github/build_github.sh
+
+      - name: Validate packaged IPA and record hashes
+        shell: bash
+        working-directory: vendor/LiveContainer
+        run: |
+          set -euo pipefail
+          test -s LiveContainer.ipa
+          test -s LiveContainer+SideStore.ipa
+          unzip -tq LiveContainer+SideStore.ipa >/dev/null
+          unzip -Z1 LiveContainer+SideStore.ipa | grep -qx 'Payload/LiveContainer.app/Frameworks/SideStoreApp.framework/SideStore'
+          {
+            echo 'Experimental LiveContainer + SideStore build (Apple 2FA fix)'
+            echo "Build date (UTC): $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            echo "LiveContainer: $LIVECONTAINER_COMMIT"
+            echo "SideStore fork: $SIDESTORE_COMMIT"
+            echo "Original SideSign: $SIDESIGN_OLD_COMMIT"
+            echo "Updated SideSign: $SIDESIGN_FIXED_COMMIT"
+            echo 'SHA-256:'
+            shasum -a 256 LiveContainer.ipa LiveContainer+SideStore.ipa ../SideStore/SideStore.ipa
+          } | tee provenance.txt
+
+      - name: Upload completed IPAs and provenance
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: "1.0"
-          files: |
-            .github/apps_ss_lc.json
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: LiveContainer-SideStore-patched
+          path: |
+            vendor/LiveContainer/LiveContainer+SideStore.ipa
+            vendor/LiveContainer/LiveContainer.ipa
+            vendor/LiveContainer/provenance.txt
+          if-no-files-found: error
+
+      - name: Upload build diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostic-logs
+          path: |
+            vendor/SideStore/build/logs/
+            vendor/LiveContainer/*.log
+          if-no-files-found: ignore
