@@ -3,7 +3,7 @@ wget https://github.com/LiveContainer/dylibify/releases/download/1.0/dylibify
 chmod +x dylibify
 brew install ldid
 
-# move lc to working folder
+# move lc to working folder a
 mv "$archive_path.xcarchive/Products/Applications" Payload
 
 # temporarily move sidestore support framrwork to tmp before zip
